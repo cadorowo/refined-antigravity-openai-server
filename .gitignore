@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+*.zip
+headless-acp-probe-report*.json
+permission-mode-probe-report.json
+profile-isolation-probe-report.json
+*token*.json
+.DS_Store
+.env
+.env.*

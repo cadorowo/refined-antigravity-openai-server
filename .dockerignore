@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.github
+*.zip
+*.tar.gz
+*.log
+.DS_Store
+*.jsonl
+*-report*.json
+tests
+coverage
+.env
+.env.*
+*.local

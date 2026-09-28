@@ -1,0 +1,38 @@
+{
+  "name": "refined-antigravity-openai-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenAI-compatible companion server for @simonepri/refined-antigravity-acp.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm typecheck && pnpm build",
+    "test": "pnpm build && node --test dist/tests/**/*.test.js",
+    "probe:headless": "pnpm build && node dist/bin/probe-headless.js",
+    "probe:modes": "pnpm build && node dist/bin/probe-modes.js",
+    "probe:profiles": "pnpm build && node dist/bin/probe-profiles.js",
+    "profile:auth": "pnpm build && node dist/bin/profile-auth.js",
+    "serve": "pnpm build && node dist/bin/server.js",
+    "start": "pnpm serve",
+    "smoke:phase3": "pnpm build && node dist/bin/smoke-test.js",
+    "smoke:phase4": "pnpm build && node dist/bin/smoke-test-phase4.js",
+    "smoke:phase5": "pnpm build && node dist/bin/smoke-test-phase5.js",
+    "smoke:phase6": "pnpm build && node dist/bin/smoke-test-phase6.js",
+    "stress": "pnpm build && node dist/bin/stress-test.js",
+    "upstream:update": "pnpm up --latest @simonepri/refined-antigravity-acp"
+  },
+  "dependencies": {
+    "@simonepri/refined-antigravity-acp": "1.2.9"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "openai": "^7.23.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "packageManager": "pnpm@9.15.4"
+}

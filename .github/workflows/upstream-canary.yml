@@ -1,0 +1,23 @@
+name: Upstream Canary
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+jobs:
+  latest-public-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --no-frozen-lockfile
+      - name: Test compilation against latest upstream package
+        run: |
+          pnpm add --save-exact @simonepri/refined-antigravity-acp@latest
+          pnpm check

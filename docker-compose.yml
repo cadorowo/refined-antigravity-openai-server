@@ -1,0 +1,17 @@
+services:
+  refined-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: refined-antigravity-openai-server
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      - REFINED_AGY_HOST=0.0.0.0
+      - REFINED_AGY_PORT=8787
+      - REFINED_AGY_API_KEY=${REFINED_AGY_API_KEY:-}
+      - REFINED_AGY_PROFILES_FILE=/data/profiles/profiles.json
+    volumes:
+      # Mount host profiles directory read-only into container
+      - ${HOME}/.config/refined-agy/profiles:/data/profiles:ro
