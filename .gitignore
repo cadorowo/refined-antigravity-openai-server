@@ -9,3 +9,4 @@ profile-isolation-probe-report.json
 .DS_Store
 .env
 .env.*
+/profiles.json

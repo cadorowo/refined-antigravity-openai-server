@@ -52,8 +52,8 @@ export function createRuntimeConnector(options: RuntimeConnectorOptions = {}): A
         ...process.env,
         AGY_ACP_FORCE_FILE_STORAGE: "1",
         BROWSER: "false",
-        ...(options.geminiHome ? { GEMINI_HOME: options.geminiHome } : {}),
         ...(options.env ?? {}),
+        ...(options.geminiHome ? { GEMINI_HOME: options.geminiHome } : {}),
       };
 
       return spawn(cmd, args, {

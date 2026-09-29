@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -192,5 +193,48 @@ test("ServerConfig unit tests", async (t) => {
         }),
       (err: unknown) => err instanceof ConfigurationError && err.message.includes("empty geminiHome"),
     );
+  });
+
+  await t.test("rejects shared profile homes and GEMINI_HOME overrides", () => {
+    const base = {
+      host: "127.0.0.1",
+      port: 8787,
+      bodyLimitBytes: 1024,
+      allowInsecureExternalBind: false,
+      shutdownGraceMs: 15000,
+    };
+    assert.throws(
+      () => validateConfig({
+        ...base,
+        profiles: [
+          { id: "a", geminiHome: "/tmp/review-home" },
+          { id: "b", geminiHome: "/tmp/../tmp/review-home" },
+        ],
+      }),
+      (err: unknown) => err instanceof ConfigurationError && err.message.includes("share GEMINI_HOME"),
+    );
+    assert.throws(
+      () => validateConfig({
+        ...base,
+        profiles: [{ id: "a", geminiHome: "/tmp/review-home", env: { GEMINI_HOME: "/tmp/other" } }],
+      }),
+      (err: unknown) => err instanceof ConfigurationError && err.message.includes("cannot override GEMINI_HOME"),
+    );
+
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "review-home-"));
+    const alias = `${home}-alias`;
+    try {
+      fs.symlinkSync(home, alias);
+      assert.throws(
+        () => validateConfig({
+          ...base,
+          profiles: [{ id: "a", geminiHome: home }, { id: "b", geminiHome: alias }],
+        }),
+        (err: unknown) => err instanceof ConfigurationError && err.message.includes("share GEMINI_HOME"),
+      );
+    } finally {
+      fs.rmSync(alias, { force: true });
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 });

@@ -28,6 +28,7 @@ import {
   readJsonBody,
   sendError,
   sendJson,
+  writeSseChunk,
 } from "../request-context.js";
 
 export async function handleChatCompletions(
@@ -252,30 +253,38 @@ async function handleStreamingCompletion(options: StreamingOptions): Promise<voi
     activeProfileId = currentProfile.id;
     attemptedProfiles.add(currentProfile.id);
 
-    const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "refined-agy-stream-"));
+    let scratchDir: string | undefined;
+    let sessionId: string | undefined;
 
     try {
       // 1. Session setup
+      scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "refined-agy-stream-"));
       const session = await currentProfile.runtime.newSession({ cwd: scratchDir });
+      sessionId = session.sessionId;
 
       const targetMode = currentProfile.config.sessionMode ?? "yolo";
       const availableModes = session.modes?.availableModes.map((m) => m.id) ?? [];
-      if (availableModes.includes(targetMode)) {
+      if (availableModes.includes(targetMode) && session.modes?.currentModeId !== targetMode) {
         await currentProfile.runtime.setMode(session.sessionId, targetMode);
       }
 
       const modelOption = session.configOptions?.find((o) => o.id === "model" || o.category === "model");
       if (modelOption) {
-        await currentProfile.runtime.setConfigOption(session.sessionId, modelOption.id, model);
+        const supported = modelOption.options?.map((opt) => String(opt.value)) ?? [];
+        if (supported.length > 0 && !supported.includes(model)) {
+          throw serviceUnavailableError(`Model '${model}' is temporarily unavailable on profile '${currentProfile.id}'`);
+        }
+        if (modelOption.currentValue !== model) {
+          await currentProfile.runtime.setConfigOption(session.sessionId, modelOption.id, model);
+        }
       }
 
-      if (reasoningEffort) {
-        const thoughtOption = session.configOptions?.find((o) => o.id === "thought_level" || o.category === "thought_level");
-        if (thoughtOption) {
-          const supported = thoughtOption.options?.map((opt) => String(opt.value)) ?? [];
-          if (supported.includes(reasoningEffort)) {
-            await currentProfile.runtime.setConfigOption(session.sessionId, thoughtOption.id, reasoningEffort);
-          }
+      const targetThought = reasoningEffort ?? "low";
+      const thoughtOption = session.configOptions?.find((o) => o.id === "thought_level" || o.category === "thought_level");
+      if (thoughtOption) {
+        const supported = thoughtOption.options?.map((opt) => String(opt.value)) ?? [];
+        if (supported.includes(targetThought) && thoughtOption.currentValue !== targetThought) {
+          await currentProfile.runtime.setConfigOption(session.sessionId, thoughtOption.id, targetThought);
         }
       }
 
@@ -306,7 +315,7 @@ async function handleStreamingCompletion(options: StreamingOptions): Promise<voi
                   },
                 ],
               };
-              res.write(`data: ${JSON.stringify(initialChunk)}\n\n`);
+              await writeSseChunk(res, `data: ${JSON.stringify(initialChunk)}\n\n`, abortController.signal);
               streamCommitted = true;
             }
 
@@ -324,7 +333,7 @@ async function handleStreamingCompletion(options: StreamingOptions): Promise<voi
                 },
               ],
             };
-            res.write(`data: ${JSON.stringify(contentChunk)}\n\n`);
+            await writeSseChunk(res, `data: ${JSON.stringify(contentChunk)}\n\n`, abortController.signal);
           }
         }
         // Note: agent_thought_chunk, tool_call, tool_call_update are filtered out
@@ -354,7 +363,7 @@ async function handleStreamingCompletion(options: StreamingOptions): Promise<voi
           },
         ],
       };
-      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+      await writeSseChunk(res, `data: ${JSON.stringify(finalChunk)}\n\n`, abortController.signal);
 
       // Send usage chunk if stream_options.include_usage was requested and usage is available
       if (includeUsage && promptResult.usage) {
@@ -368,11 +377,11 @@ async function handleStreamingCompletion(options: StreamingOptions): Promise<voi
             choices: [],
             usage,
           };
-          res.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
+          await writeSseChunk(res, `data: ${JSON.stringify(usageChunk)}\n\n`, abortController.signal);
         }
       }
 
-      res.write("data: [DONE]\n\n");
+      await writeSseChunk(res, "data: [DONE]\n\n", abortController.signal);
       res.end();
 
       currentProfile.markSuccess();
@@ -427,8 +436,9 @@ async function handleStreamingCompletion(options: StreamingOptions): Promise<voi
         throw turnError;
       }
     } finally {
+      if (sessionId) currentProfile.runtime.forgetSession(sessionId);
       lease.release();
-      await fs.rm(scratchDir, { recursive: true, force: true }).catch(() => {});
+      if (scratchDir) await fs.rm(scratchDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
@@ -462,28 +472,35 @@ async function executeTurnOnProfile(options: {
 }): Promise<TurnExecutionResult> {
   const { profile, model, promptText, reasoningEffort, signal } = options;
   const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "refined-agy-turn-"));
+  let sessionId: string | undefined;
 
   try {
     const session = await profile.runtime.newSession({ cwd: scratchDir });
+    sessionId = session.sessionId;
 
     const targetMode = profile.config.sessionMode ?? "yolo";
     const availableModes = session.modes?.availableModes.map((m) => m.id) ?? [];
-    if (availableModes.includes(targetMode)) {
+    if (availableModes.includes(targetMode) && session.modes?.currentModeId !== targetMode) {
       await profile.runtime.setMode(session.sessionId, targetMode);
     }
 
     const modelOption = session.configOptions?.find((o) => o.id === "model" || o.category === "model");
     if (modelOption) {
-      await profile.runtime.setConfigOption(session.sessionId, modelOption.id, model);
+      const supported = modelOption.options?.map((opt) => String(opt.value)) ?? [];
+      if (supported.length > 0 && !supported.includes(model)) {
+        throw serviceUnavailableError(`Model '${model}' is temporarily unavailable on profile '${profile.id}'`);
+      }
+      if (modelOption.currentValue !== model) {
+        await profile.runtime.setConfigOption(session.sessionId, modelOption.id, model);
+      }
     }
 
-    if (reasoningEffort) {
-      const thoughtOption = session.configOptions?.find((o) => o.id === "thought_level" || o.category === "thought_level");
-      if (thoughtOption) {
-        const supported = thoughtOption.options?.map((opt) => String(opt.value)) ?? [];
-        if (supported.includes(reasoningEffort)) {
-          await profile.runtime.setConfigOption(session.sessionId, thoughtOption.id, reasoningEffort);
-        }
+    const targetThought = reasoningEffort ?? "low";
+    const thoughtOption = session.configOptions?.find((o) => o.id === "thought_level" || o.category === "thought_level");
+    if (thoughtOption) {
+      const supported = thoughtOption.options?.map((opt) => String(opt.value)) ?? [];
+      if (supported.includes(targetThought) && thoughtOption.currentValue !== targetThought) {
+        await profile.runtime.setConfigOption(session.sessionId, thoughtOption.id, targetThought);
       }
     }
 
@@ -503,6 +520,10 @@ async function executeTurnOnProfile(options: {
         `Model execution returned empty content (stopReason: ${promptResult.stopReason}); possible quota exhausted or upstream error`,
       );
     }
+    const lowerContent = assistantContent.toLowerCase();
+    if (lowerContent.includes("usage limit reached") || lowerContent.includes("reached your current quota")) {
+      throw new Error(`Profile ${profile.id} quota exhausted: ${assistantContent.trim()}`);
+    }
     const usage = mapToOpenAiUsage(promptResult.usage);
 
     return {
@@ -512,6 +533,7 @@ async function executeTurnOnProfile(options: {
       profileId: profile.id,
     };
   } finally {
+    if (sessionId) profile.runtime.forgetSession(sessionId);
     await fs.rm(scratchDir, { recursive: true, force: true }).catch(() => {});
   }
 }

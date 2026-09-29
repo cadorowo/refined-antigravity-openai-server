@@ -255,4 +255,47 @@ test("ResponseRegistry unit tests", async (t) => {
     }
     assert.equal(exists, false, "Expected workspace to be cleaned up on close");
   });
+
+  await t.test("active continuation pins survive eviction and shutdown", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "reg-pinned-ws-"));
+    const registry = new ResponseRegistry({ maxEntries: 1 });
+    registry.save({
+      id: "parent",
+      createdAt: 100,
+      lastAccessedAt: Date.now(),
+      model: "test-model",
+      workspace,
+      transcript: [],
+      outputText: "parent",
+      status: "completed",
+      store: true,
+    });
+    assert.ok(registry.get("parent"));
+    const releaseFirst = registry.pinWorkspace(workspace);
+    const releaseSecond = registry.pinWorkspace(workspace);
+    registry.save({
+      id: "other",
+      createdAt: 101,
+      lastAccessedAt: Date.now(),
+      model: "test-model",
+      workspace: "",
+      transcript: [],
+      outputText: "other",
+      status: "completed",
+      store: true,
+    });
+    assert.equal(registry.get("parent"), undefined);
+    releaseFirst();
+    await registry.close();
+    assert.equal(await fs.stat(workspace).then(() => true, () => false), true);
+    releaseSecond();
+    releaseSecond();
+    let exists = true;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      exists = await fs.stat(workspace).then(() => true, () => false);
+      if (!exists) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(exists, false);
+  });
 });

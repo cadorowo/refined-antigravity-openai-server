@@ -498,6 +498,9 @@ describe("AcpRuntimeClient unit tests", () => {
       "gemini-3.1-pro",
     );
 
+    runtime.forgetSession("s-123");
+    assert.equal(runtime.getSession("s-123"), undefined);
+
     await runtime.close();
     await peer.close();
   });

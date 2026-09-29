@@ -33,7 +33,8 @@ export class ModelCatalog {
 
   private cachedModels = new Map<string, OpenAIModel>();
   private modelProfiles = new Map<string, Set<string>>();
-  private lastDiscoveredAt: number | undefined;
+  private readonly modelsByProfile = new Map<string, string[]>();
+  private nextDiscoveryAt = 0;
   private inFlightDiscovery: Promise<void> | null = null;
 
   constructor(options: ModelCatalogOptions) {
@@ -80,15 +81,13 @@ export class ModelCatalog {
    * Explicitly forces a fresh model discovery across healthy profiles.
    */
   public async refresh(): Promise<void> {
-    await this.performDiscovery();
+    await this.ensureFresh(true);
   }
 
   private async ensureFresh(force: boolean): Promise<void> {
-    const isExpired =
-      this.lastDiscoveredAt === undefined ||
-      Date.now() - this.lastDiscoveredAt > this.cacheTtlMs;
+    const isExpired = Date.now() >= this.nextDiscoveryAt;
 
-    if (force || isExpired || this.cachedModels.size === 0) {
+    if (force || isExpired) {
       if (this.inFlightDiscovery) {
         await this.inFlightDiscovery;
       } else {
@@ -111,10 +110,9 @@ export class ModelCatalog {
       return;
     }
 
-    const newModels = new Map<string, OpenAIModel>();
-    const newProfilesMap = new Map<string, Set<string>>();
     let successfulProfiles = 0;
     let lastError: unknown;
+    let incomplete = false;
 
     // Sort by priority so preferred profiles are queried first
     const sortedProfiles = [...profiles].sort(
@@ -125,6 +123,7 @@ export class ModelCatalog {
       // Skip profiles currently in terminal unhealthy state if possible, unless all are unhealthy
       const currentState = profile.currentState;
       if (currentState === "disabled" || currentState === "auth_required" || currentState === "quota_exhausted") {
+        this.modelsByProfile.delete(profile.id);
         this.logger.debug("Skipping profile during model discovery due to state", {
           profileId: profile.id,
           state: currentState,
@@ -132,31 +131,22 @@ export class ModelCatalog {
         continue;
       }
 
+      if (currentState !== "ready") {
+        incomplete = true;
+        continue;
+      }
+
       try {
         await this.profileManager.withProfile(
           async (activeProfile) => {
             const modelIds = await this.discoveryFn(activeProfile);
-            for (const id of modelIds) {
-              if (!newModels.has(id)) {
-                newModels.set(id, {
-                  id,
-                  object: "model",
-                  created: 0,
-                  owned_by: "antigravity",
-                });
-              }
-              let set = newProfilesMap.get(id);
-              if (!set) {
-                set = new Set<string>();
-                newProfilesMap.set(id, set);
-              }
-              set.add(activeProfile.id);
-            }
+            this.modelsByProfile.set(activeProfile.id, modelIds);
           },
-          { preferredProfileId: profile.id },
+          { eligibleProfileIds: [profile.id] },
         );
         successfulProfiles++;
       } catch (err) {
+        incomplete = true;
         lastError = err;
         const classification = classifyProfileFailure(err);
         this.logger.warn("Model discovery attempt failed on profile", {
@@ -167,8 +157,28 @@ export class ModelCatalog {
       }
     }
 
+    const newModels = new Map<string, OpenAIModel>();
+    const newProfilesMap = new Map<string, Set<string>>();
+    for (const [profileId, modelIds] of this.modelsByProfile) {
+      for (const id of modelIds) {
+        if (!newModels.has(id)) {
+          newModels.set(id, { id, object: "model", created: 0, owned_by: "antigravity" });
+        }
+        let set = newProfilesMap.get(id);
+        if (!set) {
+          set = new Set<string>();
+          newProfilesMap.set(id, set);
+        }
+        set.add(profileId);
+      }
+    }
+
+    this.cachedModels = newModels;
+    this.modelProfiles = newProfilesMap;
+
     if (successfulProfiles === 0) {
-      if (this.cachedModels.size > 0) {
+      if (newModels.size > 0) {
+        this.nextDiscoveryAt = Date.now() + Math.min(this.cacheTtlMs, 1_000);
         this.logger.warn(
           "Model discovery failed across all profiles; retaining previously cached models",
           { error: String(lastError) },
@@ -180,9 +190,8 @@ export class ModelCatalog {
       );
     }
 
-    this.cachedModels = newModels;
-    this.modelProfiles = newProfilesMap;
-    this.lastDiscoveredAt = Date.now();
+    // A busy profile is retried soon, without rediscovering it on every request.
+    this.nextDiscoveryAt = Date.now() + (incomplete ? Math.min(this.cacheTtlMs, 1_000) : this.cacheTtlMs);
     this.logger.info("Model discovery completed successfully", {
       modelsCount: this.cachedModels.size,
       profilesCount: successfulProfiles,
@@ -198,7 +207,11 @@ async function defaultProfileDiscovery(profile: ProfileRuntime): Promise<string[
   const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "refined-agy-model-disc-"));
   try {
     const session = await profile.runtime.newSession({ cwd: scratchDir });
-    return extractModelsFromSession(session);
+    try {
+      return extractModelsFromSession(session);
+    } finally {
+      profile.runtime.forgetSession(session.sessionId);
+    }
   } finally {
     await fs.rm(scratchDir, { recursive: true, force: true }).catch(() => {});
   }

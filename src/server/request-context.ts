@@ -164,3 +164,33 @@ export function initSseStream(
 
   res.writeHead(200, headers);
 }
+
+/** Waits for socket backpressure before consuming another upstream update. */
+export function writeSseChunk(
+  res: http.ServerResponse,
+  chunk: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (res.destroyed || res.writableEnded || signal?.aborted) {
+    return Promise.reject(new Error("SSE client disconnected"));
+  }
+  if (res.write(chunk)) return Promise.resolve();
+
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+      res.off("error", onError);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onDrain = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); reject(new Error("SSE client disconnected")); };
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    const onAbort = () => { cleanup(); reject(new Error("SSE request aborted")); };
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+    res.once("error", onError);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (res.destroyed || res.writableEnded || signal?.aborted) onAbort();
+  });
+}

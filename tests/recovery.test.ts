@@ -69,6 +69,93 @@ describe("Recovery, restart, and lease invariant unit tests", () => {
     }
   });
 
+  it("ProfileRuntime.restart() shares one in-flight restart", async () => {
+    const peers: FakeAcpPeer[] = [];
+    const { client: initialClient, peer: initialPeer } = createMockClient();
+    peers.push(initialPeer);
+    await initialClient.start();
+    const originalClose = initialClient.close.bind(initialClient);
+    let unblockClose: (() => void) | undefined;
+    let closeCalls = 0;
+    initialClient.close = async () => {
+      if (closeCalls++ === 0) {
+        await new Promise<void>((resolve) => { unblockClose = resolve; });
+      }
+      await originalClose();
+    };
+    let factoryInvocations = 0;
+    const profile = new ProfileRuntime({
+      config: { id: "p-single-flight", geminiHome: "/tmp/p-single-flight" },
+      runtime: initialClient,
+      runtimeFactory: () => {
+        factoryInvocations++;
+        const { client, peer } = createMockClient();
+        peers.push(peer);
+        return client;
+      },
+    });
+
+    const first = profile.restart();
+    const second = profile.restart();
+    assert.equal(profile.currentState, "unhealthy");
+    assert.equal(profile.restartAttemptCount, 1);
+    assert.equal(factoryInvocations, 0);
+    unblockClose?.();
+    await Promise.all([first, second]);
+    assert.equal(factoryInvocations, 1);
+    assert.equal(profile.currentState, "ready");
+
+    await profile.close();
+    for (const peer of peers) await peer.close();
+  });
+
+  it("ProfileRuntime.restart() refuses an active lease without dropping it", async () => {
+    const profile = new ProfileRuntime({
+      config: { id: "p-leased", geminiHome: "/tmp/p-leased" },
+    });
+    profile.acquireLease();
+    await assert.rejects(profile.restart(), /active lease/);
+    assert.equal(profile.activeLeaseCount, 1);
+    assert.equal(profile.currentState, "busy");
+    assert.equal(profile.restartAttemptCount, 0);
+    profile.releaseLease();
+    await profile.close();
+  });
+
+  it("ProfileRuntime.close() prevents replacement during an in-flight restart", async () => {
+    const { client: initialClient, peer } = createMockClient();
+    await initialClient.start();
+    const originalClose = initialClient.close.bind(initialClient);
+    let unblockClose: (() => void) | undefined;
+    let closeCalls = 0;
+    initialClient.close = async () => {
+      if (closeCalls++ === 0) {
+        await new Promise<void>((resolve) => { unblockClose = resolve; });
+      }
+      await originalClose();
+    };
+    let factoryInvocations = 0;
+    const profile = new ProfileRuntime({
+      config: { id: "p-closing", geminiHome: "/tmp/p-closing" },
+      runtime: initialClient,
+      runtimeFactory: () => {
+        factoryInvocations++;
+        return createMockClient().client;
+      },
+    });
+
+    const restarting = profile.restart();
+    const closing = profile.close();
+    assert.equal(profile.currentState, "disabled");
+    unblockClose?.();
+    await assert.rejects(restarting, /closed during restart/);
+    await closing;
+    assert.equal(factoryInvocations, 0);
+    assert.equal(profile.currentState, "disabled");
+    await assert.rejects(profile.restart(), /closing profile/);
+    await peer.close();
+  });
+
   it("ProfileRuntime.restart() bounds consecutive retries and marks unhealthy", async () => {
     let factoryInvocations = 0;
     const peers: FakeAcpPeer[] = [];

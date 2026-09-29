@@ -32,6 +32,9 @@ export class ProfileRuntime {
   private lastErrorMsg: string | undefined;
   private lastSuccessTime: string | undefined;
   private lastFailureTime: string | undefined;
+  private restartPromise: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
+  private closing = false;
 
   constructor(options: ProfileRuntimeOptions) {
     const raw = options.config;
@@ -115,11 +118,13 @@ export class ProfileRuntime {
   }
 
   public async start(): Promise<void> {
+    if (this.closing) throw new Error(`Cannot start closing profile: ${this.id}`);
     if (!this.config.enabled) {
       this.state = "disabled";
       throw new Error(`Cannot start disabled profile: ${this.id}`);
     }
     await this.runtime.start();
+    if (this.closing) throw new Error(`Profile '${this.id}' closed during startup`);
     if (this.state !== "cooldown" && this.state !== "quota_exhausted" && this.state !== "auth_required") {
       this.state = this.activeLeases > 0 ? "busy" : "ready";
     }
@@ -130,6 +135,8 @@ export class ProfileRuntime {
    * Enforces bounded restart attempts; blocks restart on auth_required and quota_exhausted.
    */
   public async restart(): Promise<void> {
+    if (this.restartPromise) return this.restartPromise;
+    if (this.closing) throw new Error(`Cannot restart closing profile: ${this.id}`);
     if (!this.config.enabled) {
       this.state = "disabled";
       throw new Error(`Cannot restart disabled profile: ${this.id}`);
@@ -140,6 +147,9 @@ export class ProfileRuntime {
     if (this.state === "quota_exhausted") {
       throw new Error(`Cannot restart profile '${this.id}' in quota_exhausted state`);
     }
+    if (this.activeLeases > 0) {
+      throw new Error(`Cannot restart profile '${this.id}' while it has an active lease`);
+    }
 
     if (this.consecutiveRestarts >= ProfileRuntime.MAX_CONSECUTIVE_RESTARTS) {
       this.state = "unhealthy";
@@ -149,29 +159,51 @@ export class ProfileRuntime {
     }
 
     this.consecutiveRestarts++;
-
-    // 1. Close current runtime
-    try {
-      await this.runtime.close();
-    } catch {
-      // Ignore close errors during restart
-    }
-
-    // 2. Instantiate and start fresh runtime
-    this.runtime = this.runtimeFactory();
-    await this.runtime.start();
-
-    // 3. Reset error and lease states
-    this.cooldownUntilMs = undefined;
-    this.lastFailureKind = undefined;
-    this.lastErrorMsg = undefined;
-    this.activeLeases = 0;
-    this.state = "ready";
+    this.state = "unhealthy"; // Exclude this profile from new leases during restart.
+    this.restartPromise = this.performRestart().finally(() => {
+      this.restartPromise = null;
+    });
+    return this.restartPromise;
   }
 
   public async close(): Promise<void> {
-    await this.runtime.close();
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
     this.state = "disabled";
+    this.closePromise = (async () => {
+      if (this.restartPromise) await this.restartPromise.catch(() => {});
+      try {
+        await this.runtime.close();
+      } finally {
+        this.state = "disabled";
+      }
+    })();
+    return this.closePromise;
+  }
+
+  private async performRestart(): Promise<void> {
+    try {
+      await this.runtime.close();
+    } catch (error) {
+      this.state = this.closing ? "disabled" : "unhealthy";
+      throw error;
+    }
+
+    if (this.closing) throw new Error(`Profile '${this.id}' closed during restart`);
+
+    try {
+      this.runtime = this.runtimeFactory();
+      await this.runtime.start();
+      if (this.closing) throw new Error(`Profile '${this.id}' closed during restart`);
+      this.cooldownUntilMs = undefined;
+      this.lastFailureKind = undefined;
+      this.lastErrorMsg = undefined;
+      this.state = "ready";
+    } catch (error) {
+      await this.runtime.close().catch(() => {});
+      this.state = this.closing ? "disabled" : "unhealthy";
+      throw error;
+    }
   }
 
   public async createSession(options: { cwd: string; mcpServers?: unknown[] }): Promise<SessionState> {
@@ -212,6 +244,7 @@ export class ProfileRuntime {
   }
 
   public markSuccess(): void {
+    if (this.closing || this.restartPromise) return;
     this.lastSuccessTime = new Date().toISOString();
     this.lastErrorMsg = undefined;
     this.consecutiveRestarts = 0;
@@ -230,6 +263,7 @@ export class ProfileRuntime {
     this.lastFailureTime = new Date().toISOString();
     this.lastFailureKind = kind;
     this.lastErrorMsg = error instanceof Error ? error.message : String(error);
+    if (this.closing || this.restartPromise) return;
 
     switch (kind) {
       case "auth":
@@ -254,6 +288,9 @@ export class ProfileRuntime {
   }
 
   public markReady(): void {
+    if (this.closing || this.restartPromise) {
+      throw new Error(`Cannot reset profile '${this.id}' while it is closing or restarting`);
+    }
     this.cooldownUntilMs = undefined;
     this.lastFailureKind = undefined;
     this.consecutiveRestarts = 0;

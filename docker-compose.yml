@@ -10,8 +10,26 @@ services:
     environment:
       - REFINED_AGY_HOST=0.0.0.0
       - REFINED_AGY_PORT=8787
-      - REFINED_AGY_API_KEY=${REFINED_AGY_API_KEY:-}
-      - REFINED_AGY_PROFILES_FILE=/data/profiles/profiles.json
+      - REFINED_AGY_API_KEY=${REFINED_AGY_API_KEY:?Set REFINED_AGY_API_KEY before starting the server}
+      - REFINED_AGY_PROFILES_FILE=/data/profiles.json
+      - REFINED_AGY_SHUTDOWN_GRACE_MS=15000
+      - ANTIGRAVITY_HARNESS_PATH=/home/node/.local/share/antigravity-acp/localharness_external
+      - GRPC_EXPERIMENTAL_RING_HASH_SET_REQUEST_HASH_KEY=true
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
     volumes:
-      # Mount host profiles directory read-only into container
-      - ${HOME}/.config/refined-agy/profiles:/data/profiles:ro
+      # Mount system CA certificates for HTTPS requests made by embedded Python/curl/Node
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+      # Mount authenticated host profiles into container with read-write permissions for session storage
+      - ${HOME}/.gemini-profiles:/data/profiles:rw
+      # Mount official binary cache so container doesn't re-download 1GB executable
+      - ${HOME}/.local/share/antigravity-acp:/home/node/.local/share/antigravity-acp:ro
+      # Container profile configuration
+      - ./profiles.docker.json:/data/profiles.json:ro
+    networks:
+      - default
+      - honcho_default
+
+networks:
+  default:
+  honcho_default:
+    external: true

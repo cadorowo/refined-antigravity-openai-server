@@ -180,4 +180,29 @@ test("ModelCatalog unit tests", async (t) => {
     await catalog.refresh();
     assert.equal(callCount, 2);
   });
+
+  await t.test("busy profile retains its own cached models without discovery fallback", async () => {
+    const p1 = createTestRuntime("account-a");
+    const p2 = createTestRuntime("account-b");
+    const manager = new ProfileManager([p1, p2]);
+    const discovered: string[] = [];
+    const catalog = new ModelCatalog({
+      profileManager: manager,
+      discoveryFn: async (profile) => {
+        discovered.push(profile.id);
+        return [profile.id === "account-a" ? "model-a" : "model-b"];
+      },
+    });
+
+    await catalog.listModels();
+    p1.acquireLease();
+    discovered.length = 0;
+    await catalog.refresh();
+    assert.deepEqual(discovered, ["account-b"]);
+    assert.deepEqual(catalog.getProfilesForModel("model-a"), ["account-a"]);
+    assert.deepEqual(catalog.getProfilesForModel("model-b"), ["account-b"]);
+    p1.releaseLease();
+    await catalog.refresh();
+    assert.deepEqual(discovered, ["account-b", "account-a", "account-b"]);
+  });
 });

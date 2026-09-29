@@ -150,6 +150,7 @@ export function validateConfig(config: ServerConfig): void {
   }
 
   // 6. Profiles validation
+  const profileHomes = new Map<string, string>();
   for (const profile of config.profiles) {
     if (!profile.id || typeof profile.id !== "string" || profile.id.trim().length === 0) {
       throw new ConfigurationError("Profile id cannot be empty");
@@ -157,6 +158,18 @@ export function validateConfig(config: ServerConfig): void {
     if (!profile.geminiHome || typeof profile.geminiHome !== "string" || profile.geminiHome.trim().length === 0) {
       throw new ConfigurationError(`Profile '${profile.id}' has an empty geminiHome path`);
     }
+    if (profile.env?.GEMINI_HOME !== undefined) {
+      throw new ConfigurationError(`Profile '${profile.id}' cannot override GEMINI_HOME through env`);
+    }
+    const resolvedHome = path.resolve(expandPath(profile.geminiHome));
+    const canonicalHome = fs.existsSync(resolvedHome) ? fs.realpathSync(resolvedHome) : resolvedHome;
+    const previousProfileId = profileHomes.get(canonicalHome);
+    if (previousProfileId) {
+      throw new ConfigurationError(
+        `Profiles '${previousProfileId}' and '${profile.id}' share GEMINI_HOME '${canonicalHome}'`,
+      );
+    }
+    profileHomes.set(canonicalHome, profile.id);
   }
 }
 
@@ -269,4 +282,3 @@ export function loadConfigFromEnv(input: ServerConfigInput = {}): ServerConfig {
   validateConfig(config);
   return config;
 }
-

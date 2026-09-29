@@ -1,0 +1,46 @@
+{
+  "date": "2026-09-29T09:50:13.021Z",
+  "acpModel": "gemini-3.7-flash",
+  "cliModel": "gemini-3.7-flash-low",
+  "runs": {
+    "server": {
+      "startupMs": 2700,
+      "turnMs": 5554,
+      "status": 200,
+      "output": "AGY_BENCH_OK",
+      "error": null,
+      "usage": {
+        "prompt_tokens": 13935,
+        "completion_tokens": 65,
+        "total_tokens": 14000
+      }
+    },
+    "acp": {
+      "startupMs": 2888,
+      "turnMs": 6506,
+      "stopReason": "end_turn",
+      "output": "AGY_BENCH_OK",
+      "usage": {
+        "inputTokens": 13944,
+        "outputTokens": 66,
+        "totalTokens": 14010,
+        "contextWindowMaxTokens": 1000000,
+        "contextWindowUsedTokens": 14010
+      }
+    },
+    "cli": {
+      "totalMs": 6417,
+      "exitCode": 0,
+      "status": "SUCCESS",
+      "output": "AGY_BENCH_OK",
+      "error": null,
+      "usage": {
+        "input_tokens": 13553,
+        "output_tokens": 7,
+        "thinking_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_tokens": 13560
+      }
+    }
+  }
+}

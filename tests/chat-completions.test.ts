@@ -361,6 +361,55 @@ test("Chat Completions integration unit tests", async (t) => {
     }
   });
 
+  await t.test("Stale profile model choices fail over without silently changing models", async () => {
+    const { runtime: p1 } = createConfiguredMockRuntime({
+      id: "account-a",
+      priority: 1,
+      onPrompt: async () => ({ chunks: ["wrong profile"] }),
+    });
+    const { runtime: p2 } = createConfiguredMockRuntime({
+      id: "account-b",
+      priority: 2,
+      onPrompt: async () => ({ chunks: ["correct profile"] }),
+    });
+    let modeChanges = 0;
+    const configChanges: Array<[string, unknown]> = [];
+    p2.runtime.setMode = async () => { modeChanges++; };
+    p2.runtime.setConfigOption = async (_sessionId, optionId, value) => {
+      configChanges.push([optionId, value]);
+    };
+    const originalNewSession = p1.runtime.newSession.bind(p1.runtime);
+    p1.runtime.newSession = async (options) => {
+      const session = await originalNewSession(options);
+      const modelOption = session.configOptions?.find((option) => option.id === "model");
+      if (modelOption) modelOption.options = [{ value: "model-y" }];
+      return session;
+    };
+
+    const manager = new ProfileManager([p1, p2]);
+    const catalog = new ModelCatalog({ profileManager: manager, discoveryFn: async () => ["model-x"] });
+    const server = createServer({
+      profileManager: manager,
+      modelCatalog: catalog,
+      config: { host: "127.0.0.1", port: 0 },
+    });
+    await server.start();
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "model-x", messages: [{ role: "user", content: "Hi" }] }),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json() as ChatCompletionResponse;
+      assert.equal(body.choices[0]?.message.content, "correct profile");
+      assert.equal(modeChanges, 0);
+      assert.deepEqual(configChanges, [["thought_level", "low"]]);
+    } finally {
+      await server.close();
+    }
+  });
+
   await t.test("Failover: retryable error on Profile A fails over to Profile B", async () => {
     let aAttempts = 0;
     const { runtime: p1 } = createConfiguredMockRuntime({

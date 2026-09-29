@@ -1,0 +1,25 @@
+{
+  "profiles": [
+    {
+      "id": "google1",
+      "geminiHome": "/data/profiles/new-google1",
+      "priority": 1,
+      "enabled": true,
+      "sessionMode": "yolo"
+    },
+    {
+      "id": "google2",
+      "geminiHome": "/data/profiles/new-google2",
+      "priority": 2,
+      "enabled": true,
+      "sessionMode": "yolo"
+    },
+    {
+      "id": "google3",
+      "geminiHome": "/data/profiles/new-google3",
+      "priority": 3,
+      "enabled": true,
+      "sessionMode": "yolo"
+    }
+  ]
+}

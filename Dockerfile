@@ -13,9 +13,10 @@ COPY package.json pnpm-lock.yaml tsconfig.json tsconfig.build.json ./
 # Install all dependencies (including devDependencies for build)
 RUN pnpm install --frozen-lockfile
 
-# Copy source code and entrypoints
+# Copy source code, entrypoints, and test helpers
 COPY src/ ./src/
 COPY bin/ ./bin/
+COPY tests/ ./tests/
 
 # Build TypeScript to dist
 RUN pnpm build
@@ -27,6 +28,8 @@ RUN pnpm prune --prod
 FROM node:22-bookworm-slim AS runner
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production \
     REFINED_AGY_HOST=0.0.0.0 \

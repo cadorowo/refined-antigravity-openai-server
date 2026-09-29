@@ -38,6 +38,7 @@ import {
   readJsonBody,
   sendError,
   sendJson,
+  writeSseChunk,
 } from "../request-context.js";
 
 export async function handleResponses(
@@ -100,100 +101,110 @@ export async function handleResponses(
 
   // 5. Continuation lookup via previous_response_id
   let previousRecord: ResponseRecord | undefined;
-  let workspace: string;
+  let workspace: string | undefined;
   let preferredProfileId: string | undefined;
   let isNewChain = false;
+  let releaseWorkspacePin: (() => void) | undefined;
+  let responseId: string | undefined;
 
-  if (previous_response_id) {
-    previousRecord = responseRegistry.get(previous_response_id);
-    if (!previousRecord) {
-      sendError(res, responseNotFoundError(previous_response_id), requestId);
-      return;
+  try {
+    if (previous_response_id) {
+      previousRecord = responseRegistry.get(previous_response_id);
+      if (!previousRecord) {
+        sendError(res, responseNotFoundError(previous_response_id), requestId);
+        return;
+      }
+
+      if (previousRecord.status !== "completed") {
+        sendError(
+          res,
+          new OpenAIHttpError(
+            400,
+            `Cannot continue from response '${previous_response_id}' because its status is '${previousRecord.status}'. Only completed responses can be continued.`,
+            {
+              code: "invalid_previous_response_status",
+              param: "previous_response_id",
+            },
+          ),
+          requestId,
+        );
+        return;
+      }
+
+      workspace = previousRecord.workspace;
+      releaseWorkspacePin = responseRegistry.pinWorkspace(workspace);
+      await fs.mkdir(workspace, { recursive: true }).catch(() => {});
+      preferredProfileId = previousRecord.preferredProfileId;
+    } else {
+      workspace = await fs.mkdtemp(path.join(os.tmpdir(), "refined-agy-chain-"));
+      isNewChain = true;
     }
 
-    if (previousRecord.status !== "completed") {
-      sendError(
-        res,
-        new OpenAIHttpError(
-          400,
-          `Cannot continue from response '${previous_response_id}' because its status is '${previousRecord.status}'. Only completed responses can be continued.`,
-          {
-            code: "invalid_previous_response_status",
-            param: "previous_response_id",
-          },
-        ),
-        requestId,
-      );
-      return;
-    }
-
-    workspace = previousRecord.workspace;
-    await fs.mkdir(workspace, { recursive: true }).catch(() => {});
-    preferredProfileId = previousRecord.preferredProfileId;
-  } else {
-    workspace = await fs.mkdtemp(path.join(os.tmpdir(), "refined-agy-chain-"));
-    isNewChain = true;
-  }
-
-  // 6. Context reconstruction
-  const { promptText, newTranscript } = reconstructResponseContext({
-    input,
-    instructions,
-    previousRecord,
-  });
-
-  const responseId = `resp_${crypto.randomBytes(16).toString("hex")}`;
-  const messageId = `msg_${crypto.randomBytes(16).toString("hex")}`;
-  const createdAt = Math.floor(Date.now() / 1000);
-  const reasoningEffortValue = reasoning?.effort ?? reasoning_effort;
-
-  // Link client disconnect to controller
-  res.on("close", () => {
-    if (!res.writableEnded) {
-      abortController.abort();
-    }
-  });
-
-  if (stream) {
-    await handleStreamingResponse({
-      context,
-      abortController,
-      responseId,
-      messageId,
-      createdAt,
-      model,
-      promptText,
-      newTranscript,
-      workspace,
-      isNewChain,
-      instructions: instructions ?? null,
-      previousResponseId: previous_response_id ?? null,
-      reasoningEffort: reasoningEffortValue,
-      store: store ?? true,
-      metadata: metadata ?? null,
-      preferredProfileId,
-      eligibleProfiles,
+    responseId = `resp_${crypto.randomBytes(16).toString("hex")}`;
+    // 6. Context reconstruction
+    const { promptText, newTranscript } = reconstructResponseContext({
+      input,
+      instructions,
+      previousRecord,
     });
-  } else {
-    await handleNonStreamingResponse({
-      context,
-      abortController,
-      responseId,
-      messageId,
-      createdAt,
-      model,
-      promptText,
-      newTranscript,
-      workspace,
-      isNewChain,
-      instructions: instructions ?? null,
-      previousResponseId: previous_response_id ?? null,
-      reasoningEffort: reasoningEffortValue,
-      store: store ?? true,
-      metadata: metadata ?? null,
-      preferredProfileId,
-      eligibleProfiles,
+
+    const messageId = `msg_${crypto.randomBytes(16).toString("hex")}`;
+    const createdAt = Math.floor(Date.now() / 1000);
+    const reasoningEffortValue = reasoning?.effort ?? reasoning_effort;
+
+    // Link client disconnect to controller
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        abortController.abort();
+      }
     });
+
+    if (stream) {
+      await handleStreamingResponse({
+        context,
+        abortController,
+        responseId,
+        messageId,
+        createdAt,
+        model,
+        promptText,
+        newTranscript,
+        workspace,
+        isNewChain,
+        instructions: instructions ?? null,
+        previousResponseId: previous_response_id ?? null,
+        reasoningEffort: reasoningEffortValue,
+        store: store ?? true,
+        metadata: metadata ?? null,
+        preferredProfileId,
+        eligibleProfiles,
+      });
+    } else {
+      await handleNonStreamingResponse({
+        context,
+        abortController,
+        responseId,
+        messageId,
+        createdAt,
+        model,
+        promptText,
+        newTranscript,
+        workspace,
+        isNewChain,
+        instructions: instructions ?? null,
+        previousResponseId: previous_response_id ?? null,
+        reasoningEffort: reasoningEffortValue,
+        store: store ?? true,
+        metadata: metadata ?? null,
+        preferredProfileId,
+        eligibleProfiles,
+      });
+    }
+  } finally {
+    if (isNewChain && workspace && (!responseId || !(store ?? true) || !responseRegistry.get(responseId))) {
+      await fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
+    }
+    releaseWorkspacePin?.();
   }
 }
 
@@ -356,9 +367,6 @@ async function handleNonStreamingResponse(options: NonStreamingResponseOptions):
         metadata,
         store: true,
       });
-    } else if (isNewChain) {
-      // Clean up ephemeral workspace if store is false and chain won't be continued
-      fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
     }
 
     logger.info("Response non-streaming completed", {
@@ -388,9 +396,6 @@ async function handleNonStreamingResponse(options: NonStreamingResponseOptions):
 
     sendJson(res, 200, responsePayload, requestId);
   } catch (error) {
-    if (isNewChain && !store) {
-      fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
-    }
     if (error instanceof NoAvailableProfileError) {
       sendError(
         res,
@@ -475,31 +480,38 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
 
     const currentProfile = lease.profile;
     attemptedProfiles.add(currentProfile.id);
+    let sessionId: string | undefined;
 
     try {
       // 1. Session setup
       const session = await currentProfile.runtime.newSession({ cwd: workspace });
+      sessionId = session.sessionId;
 
       const targetMode = currentProfile.config.sessionMode ?? "yolo";
       const availableModes = session.modes?.availableModes.map((m) => m.id) ?? [];
-      if (availableModes.includes(targetMode)) {
+      if (availableModes.includes(targetMode) && session.modes?.currentModeId !== targetMode) {
         await currentProfile.runtime.setMode(session.sessionId, targetMode);
       }
 
       const modelOption = session.configOptions?.find((o) => o.id === "model" || o.category === "model");
       if (modelOption) {
-        await currentProfile.runtime.setConfigOption(session.sessionId, modelOption.id, model);
+        const supported = modelOption.options?.map((opt) => String(opt.value)) ?? [];
+        if (supported.length > 0 && !supported.includes(model)) {
+          throw serviceUnavailableError(`Model '${model}' is temporarily unavailable on profile '${currentProfile.id}'`);
+        }
+        if (modelOption.currentValue !== model) {
+          await currentProfile.runtime.setConfigOption(session.sessionId, modelOption.id, model);
+        }
       }
 
-      if (reasoningEffort) {
-        const thoughtOption = session.configOptions?.find(
-          (o) => o.id === "thought_level" || o.category === "thought_level",
-        );
-        if (thoughtOption) {
-          const supported = thoughtOption.options?.map((opt) => String(opt.value)) ?? [];
-          if (supported.includes(reasoningEffort)) {
-            await currentProfile.runtime.setConfigOption(session.sessionId, thoughtOption.id, reasoningEffort);
-          }
+      const targetThought = reasoningEffort ?? "low";
+      const thoughtOption = session.configOptions?.find(
+        (o) => o.id === "thought_level" || o.category === "thought_level",
+      );
+      if (thoughtOption) {
+        const supported = thoughtOption.options?.map((opt) => String(opt.value)) ?? [];
+        if (supported.includes(targetThought) && thoughtOption.currentValue !== targetThought) {
+          await currentProfile.runtime.setConfigOption(session.sessionId, thoughtOption.id, targetThought);
         }
       }
 
@@ -520,7 +532,7 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
               initSseStream(res, requestId);
 
               // 3a. response.created
-              sendSseEvent(res, {
+              await sendSseEvent(res, {
                 type: "response.created",
                 sequence_number: sequenceNumber++,
                 response: {
@@ -543,10 +555,10 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
                   top_p: null,
                   previous_response_id: previousResponseId,
                 },
-              });
+              }, abortController.signal);
 
               // 3b. response.output_item.added
-              sendSseEvent(res, {
+              await sendSseEvent(res, {
                 type: "response.output_item.added",
                 sequence_number: sequenceNumber++,
                 output_index: 0,
@@ -557,10 +569,10 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
                   role: "assistant",
                   content: [],
                 },
-              });
+              }, abortController.signal);
 
               // 3c. response.content_part.added
-              sendSseEvent(res, {
+              await sendSseEvent(res, {
                 type: "response.content_part.added",
                 sequence_number: sequenceNumber++,
                 output_index: 0,
@@ -571,13 +583,13 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
                   text: "",
                   annotations: [],
                 },
-              });
+              }, abortController.signal);
 
               streamCommitted = true;
             }
 
             // 3d. response.output_text.delta
-            sendSseEvent(res, {
+            await sendSseEvent(res, {
               type: "response.output_text.delta",
               sequence_number: sequenceNumber++,
               output_index: 0,
@@ -585,7 +597,7 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
               content_index: 0,
               delta: chunkText,
               logprobs: [],
-            });
+            }, abortController.signal);
 
             accumulatedContent += chunkText;
           }
@@ -605,7 +617,7 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
       }
 
       // 4. Final events sequence: text.done, content_part.done, output_item.done, completed
-      sendSseEvent(res, {
+      await sendSseEvent(res, {
         type: "response.output_text.done",
         sequence_number: sequenceNumber++,
         output_index: 0,
@@ -613,9 +625,9 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
         content_index: 0,
         text: accumulatedContent,
         logprobs: [],
-      });
+      }, abortController.signal);
 
-      sendSseEvent(res, {
+      await sendSseEvent(res, {
         type: "response.content_part.done",
         sequence_number: sequenceNumber++,
         output_index: 0,
@@ -626,7 +638,7 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
           text: accumulatedContent,
           annotations: [],
         },
-      });
+      }, abortController.signal);
 
       const finalOutputItem: ResponseOutputMessage = {
         id: messageId,
@@ -642,12 +654,12 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
         ],
       };
 
-      sendSseEvent(res, {
+      await sendSseEvent(res, {
         type: "response.output_item.done",
         sequence_number: sequenceNumber++,
         output_index: 0,
         item: finalOutputItem,
-      });
+      }, abortController.signal);
 
       const completedResponse: ResponseObject = {
         id: responseId,
@@ -671,11 +683,11 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
         ...(usage !== undefined ? { usage } : {}),
       };
 
-      sendSseEvent(res, {
+      await sendSseEvent(res, {
         type: "response.completed",
         sequence_number: sequenceNumber++,
         response: completedResponse,
-      });
+      }, abortController.signal);
 
       res.end();
 
@@ -700,8 +712,6 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
           metadata,
           store: true,
         });
-      } else if (isNewChain) {
-        fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
       }
 
       logger.info("Response streaming completed", {
@@ -756,15 +766,13 @@ async function handleStreamingResponse(options: StreamingResponseOptions): Promi
         throw turnError;
       }
     } finally {
+      if (sessionId) currentProfile.runtime.forgetSession(sessionId);
       lease.release();
     }
   }
 
   // If we reach here, all attempts failed before output commit
   if (!streamCommitted) {
-    if (isNewChain && !store) {
-      fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
-    }
     if (lastError instanceof NoAvailableProfileError) {
       sendError(
         res,
@@ -797,60 +805,75 @@ async function executeTurnOnProfile(options: {
   logger: RequestContext["logger"];
 }): Promise<TurnExecutionResult> {
   const { profile, model, promptText, workspace, reasoningEffort, signal } = options;
-
   const session = await profile.runtime.newSession({ cwd: workspace });
+  try {
+    const targetMode = profile.config.sessionMode ?? "yolo";
+    const availableModes = session.modes?.availableModes.map((m) => m.id) ?? [];
+    if (availableModes.includes(targetMode) && session.modes?.currentModeId !== targetMode) {
+      await profile.runtime.setMode(session.sessionId, targetMode);
+    }
 
-  const targetMode = profile.config.sessionMode ?? "yolo";
-  const availableModes = session.modes?.availableModes.map((m) => m.id) ?? [];
-  if (availableModes.includes(targetMode)) {
-    await profile.runtime.setMode(session.sessionId, targetMode);
-  }
+    const modelOption = session.configOptions?.find((o) => o.id === "model" || o.category === "model");
+    if (modelOption) {
+      const supported = modelOption.options?.map((opt) => String(opt.value)) ?? [];
+      if (supported.length > 0 && !supported.includes(model)) {
+        throw serviceUnavailableError(`Model '${model}' is temporarily unavailable on profile '${profile.id}'`);
+      }
+      if (modelOption.currentValue !== model) {
+        await profile.runtime.setConfigOption(session.sessionId, modelOption.id, model);
+      }
+    }
 
-  const modelOption = session.configOptions?.find((o) => o.id === "model" || o.category === "model");
-  if (modelOption) {
-    await profile.runtime.setConfigOption(session.sessionId, modelOption.id, model);
-  }
-
-  if (reasoningEffort) {
+    const targetThought = reasoningEffort ?? "low";
     const thoughtOption = session.configOptions?.find(
       (o) => o.id === "thought_level" || o.category === "thought_level",
     );
     if (thoughtOption) {
       const supported = thoughtOption.options?.map((opt) => String(opt.value)) ?? [];
-      if (supported.includes(reasoningEffort)) {
-        await profile.runtime.setConfigOption(session.sessionId, thoughtOption.id, reasoningEffort);
+      if (supported.includes(targetThought) && thoughtOption.currentValue !== targetThought) {
+        await profile.runtime.setConfigOption(session.sessionId, thoughtOption.id, targetThought);
       }
     }
-  }
 
-  const turn = profile.runtime.prompt(session.sessionId, promptText, { signal });
+    const turn = profile.runtime.prompt(session.sessionId, promptText, { signal });
 
-  let assistantContent = "";
-  for await (const update of turn.updates) {
-    if (update.sessionUpdate === "agent_message_chunk") {
-      const text = extractChunkText(update.update);
-      assistantContent += text;
+    let assistantContent = "";
+    for await (const update of turn.updates) {
+      if (update.sessionUpdate === "agent_message_chunk") {
+        const text = extractChunkText(update.update);
+        assistantContent += text;
+      }
     }
-  }
 
-  const promptResult = await turn.result;
-  if (assistantContent.trim() === "") {
-    throw new Error(
-      `Model execution returned empty content (stopReason: ${promptResult.stopReason}); possible quota exhausted or upstream error`,
-    );
-  }
-  const usage = mapToResponseUsage(promptResult.usage);
+    const promptResult = await turn.result;
+    if (assistantContent.trim() === "") {
+      throw new Error(
+        `Model execution returned empty content (stopReason: ${promptResult.stopReason}); possible quota exhausted or upstream error`,
+      );
+    }
+    const lowerContent = assistantContent.toLowerCase();
+    if (lowerContent.includes("usage limit reached") || lowerContent.includes("reached your current quota")) {
+      throw new Error(`Profile ${profile.id} quota exhausted: ${assistantContent.trim()}`);
+    }
+    const usage = mapToResponseUsage(promptResult.usage);
 
-  return {
-    assistantContent,
-    stopReason: promptResult.stopReason,
-    ...(usage !== undefined ? { usage } : {}),
-    profileId: profile.id,
-  };
+    return {
+      assistantContent,
+      stopReason: promptResult.stopReason,
+      ...(usage !== undefined ? { usage } : {}),
+      profileId: profile.id,
+    };
+  } finally {
+    profile.runtime.forgetSession(session.sessionId);
+  }
 }
 
-function sendSseEvent(res: import("node:http").ServerResponse, event: ResponseStreamServerEvent): void {
-  res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+function sendSseEvent(
+  res: import("node:http").ServerResponse,
+  event: ResponseStreamServerEvent,
+  signal: AbortSignal,
+): Promise<void> {
+  return writeSseChunk(res, `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`, signal);
 }
 
 function mapToResponseUsage(promptUsage?: PromptUsage): ResponseUsage | undefined {

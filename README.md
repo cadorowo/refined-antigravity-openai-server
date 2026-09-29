@@ -233,6 +233,7 @@ export REFINED_AGY_PROFILES_FILE=/path/to/profiles.json
 
 Each profile must use a dedicated `GEMINI_HOME`.
 Do not reuse one writable `GEMINI_HOME` across multiple concurrently running profiles.
+Startup rejects duplicate profile homes, including existing symlink aliases, and rejects `GEMINI_HOME` overrides in profile `env`.
 
 ## Authentication
 
@@ -440,6 +441,11 @@ docker build -t refined-antigravity-openai-server .
 
 Credentials must be mounted from the host.
 They should never be baked into the image.
+
+For the included Compose configuration, set a unique `REFINED_AGY_API_KEY`
+in an ignored `.env` file before running `docker compose up`. Compose rejects
+an unset or empty key. The example Compose setup mounts host profiles from
+`~/.gemini-profiles` and reads `profiles.docker.json`.
 
 Example conceptual layout:
 

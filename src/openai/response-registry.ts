@@ -37,6 +37,8 @@ export interface ResponseRegistryOptions {
 export class ResponseRegistry {
   private readonly records = new Map<string, ResponseRecord>();
   private readonly workspaceRefCounts = new Map<string, number>();
+  private readonly workspacePins = new Map<string, number>();
+  private closed = false;
   private readonly maxEntries: number;
   private readonly ttlMs: number;
   private readonly logger?: {
@@ -75,12 +77,33 @@ export class ResponseRegistry {
     return record;
   }
 
+  /** Keeps a chain workspace alive while a continuation is using it. */
+  public pinWorkspace(workspace: string): () => void {
+    if (this.closed) throw new Error("ResponseRegistry is closed");
+    this.workspacePins.set(workspace, (this.workspacePins.get(workspace) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.workspacePins.get(workspace) ?? 1) - 1;
+      if (remaining > 0) {
+        this.workspacePins.set(workspace, remaining);
+      } else {
+        this.workspacePins.delete(workspace);
+        if (!this.workspaceRefCounts.has(workspace)) {
+          fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
+        }
+      }
+    };
+  }
+
   /**
    * Stores a completed response record.
    * If store is false, the record is not stored in the registry.
    * Evicts expired records and enforces maxEntries bounding.
    */
   public save(record: ResponseRecord): void {
+    if (this.closed) return;
     if (!record.store) {
       this.logger?.debug("Skipping storage for response record where store=false", { id: record.id });
       return;
@@ -172,7 +195,11 @@ export class ResponseRegistry {
    * Cleans up all stored records and removes any managed workspaces.
    */
   public async close(): Promise<void> {
-    const workspacesToClean = Array.from(this.workspaceRefCounts.keys());
+    if (this.closed) return;
+    this.closed = true;
+    const workspacesToClean = Array.from(this.workspaceRefCounts.keys()).filter(
+      (workspace) => !this.workspacePins.has(workspace),
+    );
     this.records.clear();
     this.workspaceRefCounts.clear();
 
@@ -219,7 +246,9 @@ export class ResponseRegistry {
 
     if (current <= 1) {
       this.workspaceRefCounts.delete(workspace);
-      fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
+      if (!this.workspacePins.has(workspace)) {
+        fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
+      }
     } else {
       this.workspaceRefCounts.set(workspace, current - 1);
     }

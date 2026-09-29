@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import test from "node:test";
 
 import { AcpRuntimeClient } from "../src/acp/runtime-client.js";
@@ -265,6 +266,45 @@ function createConfiguredMockRuntime(config: MockRuntimeConfig): {
 }
 
 test("Responses API HTTP integration unit tests", async (t) => {
+  await t.test("failed stored response removes its new chain workspace", async () => {
+    const mock = createConfiguredMockRuntime({
+      id: "cleanup-failure",
+      onPrompt: async () => ({ chunks: [], failBeforeFirstChunk: true, failFatal: true }),
+    });
+    let workspace: string | undefined;
+    const originalNewSession = mock.runtime.runtime.newSession.bind(mock.runtime.runtime);
+    mock.runtime.runtime.newSession = async (options) => {
+      workspace = options.cwd;
+      return originalNewSession(options);
+    };
+    const profileManager = new ProfileManager([mock.runtime]);
+    const catalog = new ModelCatalog({ profileManager, discoveryFn: async () => ["model-x"] });
+    const server = createServer({
+      profileManager,
+      modelCatalog: catalog,
+      config: { host: "127.0.0.1", port: 0 },
+    });
+    await server.start();
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "model-x", input: "fail", store: true }),
+      });
+      assert.equal(response.status, 500);
+      assert.ok(workspace);
+      let exists = true;
+      for (let attempt = 0; attempt < 10; attempt++) {
+        exists = await fs.stat(workspace).then(() => true, () => false);
+        if (!exists) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(exists, false);
+    } finally {
+      await server.close();
+    }
+  });
+
   await t.test("Non-streaming POST /v1/responses basic success with real usage", async () => {
     const mock = createConfiguredMockRuntime({
       id: "p1",

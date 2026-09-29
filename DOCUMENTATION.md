@@ -229,7 +229,7 @@ Implemented & Verified:
 - Stateful conversation continuation via `previous_response_id` reconstructing full conversation transcripts across fresh per-turn ACP sessions;
 - In-memory bounded `ResponseRegistry` with configurable capacity and TTL eviction (`REFINED_AGY_RESPONSE_REGISTRY_MAX_ENTRIES`, `REFINED_AGY_RESPONSE_REGISTRY_TTL_MS`);
 - Parent record immutability supporting branching conversation trees from common ancestors without cross-branch contamination;
-- Server-managed chain workspaces (`/tmp/refined-agy-chain-...`) reused across continuation turns and ref-count cleaned upon registry eviction;
+- Server-managed chain workspaces (`/tmp/refined-agy-chain-...`) reused across continuation turns, pinned while a continuation is active, and cleaned after the final record and active continuation release them;
 - Profile affinity with conservative pre-output failover (preferred profile reused if available; fails over to healthy secondary profile before stream commit; strictly no post-output failover);
 - Strict instruction isolation: instructions from previous turns are never replayed into AGY prompts; only new turn instructions are applied;
 - Authentic token usage propagation (`input_tokens`, `output_tokens`, `total_tokens`) without fake zeroes;
@@ -246,12 +246,12 @@ Implemented & Verified:
 - Protected `/status` operational diagnostics endpoint (authenticated with Bearer token matching `REFINED_AGY_API_KEY` when configured; returns sanitized `RuntimeMetrics` and profile snapshots with no secrets, tokens, or absolute paths);
 - Production runtime metrics (`RuntimeMetrics` in `src/server/metrics.ts`): tracks uptime, total requests, active requests, error counts, status code breakdown, route distribution, input/output/total token counts, active stream counts, latency statistics (avg, min, max), and process memory (`rss`, `heapUsed`, `heapTotal`, `external`);
 - Secret redaction and sanitized logging (`DefaultServerLogger` in `src/server/logger.ts`): automatic pattern redaction for Bearer tokens, OAuth tokens, authorization headers, absolute paths, and cookies across all log levels and structured metadata;
-- Bounded profile recovery and restart (`ProfileRuntime.restart()` and `ProfileManager.restartProfile(id)`): bounded restarts (maximum 3 attempts with exponential backoff) with strict guards blocking restart attempts on `auth_required` and `quota_exhausted` states;
+- Bounded profile recovery and restart (`ProfileRuntime.restart()` and `ProfileManager.restartProfile(id)`): maximum 3 consecutive restart attempts with guards blocking attempts on `auth_required`, `quota_exhausted`, and active leases; concurrent restart calls share one attempt, and shutdown prevents replacement startup; restart attempts currently have no automatic backoff;
 - Strict lease release invariants: guaranteed lease release via `try...finally` across normal turns, client disconnects/aborts (`session/cancel`), and upstream errors;
 - Production packaging: containerized deployment via `Dockerfile` (Node 22 slim, non-root `node` user, pnpm build, built-in healthcheck), `.dockerignore`, and `docker-compose.yml` with host profile volume mounting;
-- Multi-account pool expansion: 3rd Antigravity profile (`account-c`) authenticated (`eimenaicha2@gmail.com`) under `~/.config/refined-agy/profiles/account-c/gemini`, integrated into auto-discovery, and verified with live multi-profile failover from quota-exhausted accounts;
+- Multi-account pool expansion: 3rd Antigravity profile (`account-c`) authenticated under `~/.config/refined-agy/profiles/account-c/gemini`, integrated into auto-discovery, and verified with live multi-profile failover from quota-exhausted accounts;
 - Concurrency and stress test suite (`bin/stress-test.ts` / `pnpm stress`): validates 5 operational scenarios (concurrency saturation across profiles, 503 capacity exhaustion rejection, mixed streaming workload, sequential soak, and metrics invariants);
-- Complete test verification: 183 / 183 unit tests passing (100%), and end-to-end live smoke test (`bin/smoke-test-phase6.ts` / `pnpm smoke:phase6`) passing.
+- Current local test verification: 193 / 193 tests passing. A focused live smoke test on the local `google1` profile verified restart but stopped at model discovery because upstream returned `Authentication required`; the two-turn live Responses check could not complete. The earlier full end-to-end live smoke test (`bin/smoke-test-phase6.ts` / `pnpm smoke:phase6`) was not rerun for these changes.
 
 ---
 
@@ -310,6 +310,8 @@ Prompt cancellation maps to `session/cancel`.
 
 HTTP disconnect handling in later phases must propagate through `AbortSignal`.
 
+Local ACP session metadata is removed after each ephemeral HTTP turn and model-discovery session. Closing the runtime clears any remaining session metadata.
+
 ---
 
 # 6. Permission Model
@@ -359,6 +361,7 @@ Each profile receives its own child environment, conceptually:
 ```
 
 Do not mutate global `process.env.GEMINI_HOME`.
+Startup validation rejects profiles that resolve to the same writable `GEMINI_HOME`, including existing symlink aliases, and rejects `env.GEMINI_HOME` overrides.
 
 ## 7.2 Profile states
 
@@ -409,9 +412,10 @@ The profile layer supports a preferred profile concept for stateful APIs (such a
 
 Profile runtimes can recover from transient child process crashes or IPC reader disconnections:
 
-- **Bounded attempts**: Maximum 3 restart attempts (`maxRestartAttempts = 3`) with exponential backoff cooldowns.
+- **Bounded attempts**: Maximum 3 consecutive restart attempts (`maxRestartAttempts = 3`); no automatic backoff loop is implemented.
 - **Fail-closed guards**: Restart is strictly prohibited if a profile is marked `auth_required` (needs user re-authentication) or `quota_exhausted` (needs provider quota reset).
-- **Lease safety**: Before initiating restart, any existing lease is guaranteed released. Upon successful restart, attempts counter resets to 0 and state transitions back to `ready`.
+- **Lease safety**: Restart rejects a profile with an active lease without dropping it. A profile is unavailable for new leases throughout restart and returns to `ready` after a successful replacement startup. Successful request processing resets the consecutive restart counter.
+- **Concurrency and shutdown**: Concurrent restart calls share one in-flight operation. Shutdown waits for it and prevents a replacement runtime from becoming available.
 - **Management API**: Exposed via `profileManager.restartProfile(profileId)`.
 
 ---
@@ -524,7 +528,7 @@ AGY has exposed models through:
 - `session.models.availableModels`;
 - model choices in `session.configOptions`.
 
-Current discovery checks both. Do not hardcode currently observed IDs.
+Current discovery checks both. Do not hardcode currently observed IDs. Discovery leases the exact profile being queried; a busy profile keeps its last known model mapping and is retried on a later request after a short interval.
 
 ---
 
@@ -713,7 +717,7 @@ Real smoke test verified against live Google Antigravity profiles (`pnpm smoke:p
 
 ## Phase 6
 
-Current unit test status: **183 / 183 PASS** across 6 test suites (`pnpm test`).
+Current local test status: **189 / 189 PASS** (`pnpm test`).
 
 Covered areas include:
 - Operational health checks (`/healthz` liveness, `/readyz` readiness returning 200 when ready profiles exist and 503 when all busy/exhausted/draining);
@@ -730,10 +734,10 @@ Concurrency & Stress Test Suite (`bin/stress-test.ts` / `pnpm stress`):
 - **Scenario 2 (Capacity Exhaustion)**: 3 simultaneous requests against 2 profiles; 2 succeed concurrently, 3rd immediately receives 503 Service Unavailable: PASS
 - **Scenario 3 (Mixed Streaming Workload)**: Concurrent Chat Completion SSE stream + Responses API SSE stream running in parallel: PASS
 - **Scenario 4 (Sequential Soak)**: 5 sequential completion turns completing cleanly with invariant lease assertions: PASS
-- **Scenario 5 (Status Report Invariants)**: `/status` accurately reflects metrics (15 requests, 1 error, latency percentiles, memory RSS/heap, zero leaked leases): PASS
+- **Scenario 5 (Status Report Invariants)**: `/status` accurately reflects metrics (15 requests, 1 error, latency average/min/max, memory RSS/heap, zero leaked leases): PASS
 
 Real 3-Profile Live Smoke Test (`bin/smoke-test-phase6.ts` / `pnpm smoke:phase6`):
-- Multi-account setup: `account-a` and `account-b` (both hit daily quota limit) + newly authenticated `account-c` (`eimenaicha2@gmail.com`);
+- Multi-account setup: `account-a` and `account-b` (both hit daily quota limit) + newly authenticated `account-c`;
 - `/healthz` returns 200 OK: PASS
 - `/readyz` returns 200 OK with ready profiles: PASS
 - Dynamic model discovery from AGY: PASS
@@ -806,6 +810,8 @@ Event structure:
 4. Optional usage chunk if `stream_options.include_usage: true` and usage is available;
 5. Terminal `data: [DONE]`.
 
+SSE writes wait for Node's `drain` event when the HTTP writable buffer fills; disconnect or abort ends that wait. The ACP update queue does not yet provide end-to-end backpressure to the upstream process.
+
 ## 14.5 Streaming failover boundary
 
 Before first committed content delta: `transparent failover allowed`.
@@ -837,11 +843,12 @@ Implemented in `src/openai/response-registry.ts`:
 - **LRU and TTL eviction**: Configurable via `responseRegistryMaxEntries` (default: 1000) and `responseRegistryTtlMs` (default: 1 hour).
 - **Ephemeral handling**: Requests with `store: false` skip registry storage; ephemeral responses are returned to the client and discarded immediately.
 - **Reference-counted workspaces**: Chain workspace directories (`/tmp/refined-agy-chain-...`) track active references across branched trees and are automatically unlinked (`fs.rm`) once all referencing responses are evicted or deleted.
+- New chain workspaces are also removed when generation fails or `store: false` prevents registry insertion.
 
 ## 15.2 Stateful Context Reconstruction & Chain Workspaces
 
 Implemented in `src/openai/response-converter.ts`:
-- **Stateful continuation via `previous_response_id`**: Traverses the parent chain in `ResponseRegistry` to reconstruct the full chronological conversation transcript (`NormalizedConversationMessage[]`).
+- **Stateful continuation via `previous_response_id`**: Copies the parent record's self-contained transcript snapshot and appends the current turn (`NormalizedConversationMessage[]`).
 - **Parent immutability & branching**: Parent response records are never mutated by continuation turns. Multiple child responses can branch from the same parent without state cross-contamination.
 - **Per-turn fresh ACP sessions**: Rather than keeping long-lived, opaque ACP sessions open indefinitely, each turn executes in a fresh ACP session with reconstructed context and reuses the chain workspace directory.
 - **Managed chain workspace**: File mutations performed by tool execution in earlier turns remain available to subsequent continuation turns.
@@ -866,6 +873,7 @@ Responses API SSE streaming uses typed events rather than raw completion chunks:
 - `response.completed`: Terminal event containing the final completed response object with authentic usage metrics.
 - **Strict monotonic sequence numbering**: Every event carries a zero-indexed, strictly increasing integer `sequence_number` (0, 1, 2, ...).
 - **No `[DONE]` event**: Compliant with official OpenAI Responses specification; streams terminate after `response.completed`.
+- **HTTP backpressure**: Each SSE write waits for `drain` before the route consumes another ACP update; the upstream ACP update queue itself remains unbounded.
 
 ## 15.5 Instruction Isolation & Strict Validation
 
@@ -928,7 +936,7 @@ Implemented:
 
 - Operational split: `/healthz` (liveness) and `/readyz` (readiness);
 - Protected `/status` diagnostics endpoint with Bearer auth;
-- Runtime metrics aggregation (`RuntimeMetrics`) tracking requests, status codes, routes, tokens, active streams, latency percentiles, and memory;
+- Runtime metrics aggregation (`RuntimeMetrics`) tracking requests, routes, tokens, active streams, latency average/min/max, and memory;
 - Secret redaction across server logging (`DefaultServerLogger`);
 - Bounded profile restarts (max 3, auth/quota protection);
 - Guaranteed lease release invariant across success, cancellation, abort, disconnect;
@@ -1018,8 +1026,8 @@ Before an agent says a phase is complete:
 
 # 21. Last Updated
 
-**2026-09-28**
+**2026-09-29**
 
 Current canonical state:
 
-`Phase 6 COMPLETE (Operational Hardening, Packaging, Multi-Account Pool & Concurrency Validation).`
+`Phase 6 COMPLETE; independent review fixes for profile-home validation, ephemeral cleanup, model discovery, and HTTP SSE backpressure verified locally.`

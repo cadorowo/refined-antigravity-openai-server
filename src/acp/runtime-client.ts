@@ -168,6 +168,11 @@ export class AcpRuntimeClient {
     return this.sessions.get(sessionId);
   }
 
+  /** Release local session metadata after its final prompt or discovery use. */
+  public forgetSession(sessionId: string): void {
+    this.sessions.delete(sessionId);
+  }
+
   /**
    * Starts the runtime client in a single-flight manner.
    * If already started, this is a no-op.
@@ -421,6 +426,8 @@ export class AcpRuntimeClient {
         }
       }
     })();
+    // The updates iterator can fail before its caller reaches `turn.result`.
+    resultPromise.catch(() => {});
 
     return {
       sessionId,
@@ -539,6 +546,8 @@ export class AcpRuntimeClient {
         timer,
       });
     });
+    // A write failure can bypass the pending response promise below.
+    promise.catch(() => {});
 
     try {
       await this.sendSerializedMessage({
@@ -731,6 +740,7 @@ export class AcpRuntimeClient {
     this.writer = null;
     this.reader = null;
     this.started = false;
+    this.sessions.clear();
 
     if (writer) {
       try {
